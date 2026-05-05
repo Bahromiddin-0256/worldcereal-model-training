@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# data / outputs
+data/
+outputs/
+logs/
+*.log
+*.tif
+*.tiff
+*.geoparquet
+
+# models — keep the small worldcereal artifact tracked, exclude bulky checkpoints
+models/**/checkpoints/
+models/**/*.ckpt
+models/**/*.pt
+models/**/*.zip
+models/**/*.json
+.idea/
+.claude/
+catboost_info/

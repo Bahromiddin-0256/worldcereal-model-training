@@ -7,7 +7,8 @@ Pipeline:
 2. Map uzcosmos crop labels onto WorldCereal ewoc_codes:
        bugdoy  -> 1101010001  (unspecified_winter_wheat)
        paxta   -> 1108000010  (cotton)
-       other   -> 1700000000  (non_cropland_excl_perennial)
+       other   -> 1100000000  (generic temporary_crops — cropland that is
+                                not wheat or cotton in the uzcosmos campaign)
 3. Convert polygons to centroids and add the columns the WorldCereal
    ``run_extractions`` API expects (sample_id, ewoc_code, valid_time, …).
 4. Write the GeoParquet that the API consumes.
@@ -62,13 +63,15 @@ _log = get_logger(__name__)
 # uzcosmos crop_type -> WorldCereal ewoc_code.
 # - bugdoy is winter wheat in Uzbekistan; harvested ~June.
 # - paxta is cotton; harvested ~Sep-Oct.
-# - "other" inside a uzcosmos campaign means the polygon was checked
-#   and is not a crop of interest — treat as generic non-cropland so
-#   the encoder learns a clean negative.
+# - "other" inside a uzcosmos campaign means the polygon was checked,
+#   is cropland, but is neither wheat nor cotton. Map to the generic
+#   temporary_crops code so WorldCereal treats it as cropland (1100000000
+#   maps to "temporary_crops" in the croptype mappings, whereas 1700000000
+#   would be non_cropland and gets dropped as "ignore").
 EWOC_CODES = {
     "bugdoy": 1101010001,
     "paxta": 1108000010,
-    "other": 1700000000,
+    "other": 1100000000,
 }
 
 # Uzbekistan 2024/2025 growing season midpoint. WorldCereal grabs

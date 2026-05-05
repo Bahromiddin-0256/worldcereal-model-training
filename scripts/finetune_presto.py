@@ -8,7 +8,9 @@ Pipeline
 2. Map our 3 ewoc_codes to crop-type labels:
        1101010001 -> wheat        (bugdoy)
        1108000010 -> fibre_crops  (paxta)
-       1700000000 -> no_crop      (other)
+       1100000000 -> other_crops  (other — cropland that's not wheat or cotton)
+   1700000000 is also mapped to ``other_crops`` for backward-compatibility
+   with parquets extracted before the ewoc_code was corrected.
 3. Use WorldCereal's ``get_training_dfs_from_parquet`` to wide-pivot the
    monthly time series and split train/val/test by H3 cell so spatial
    leakage is controlled.
@@ -56,13 +58,16 @@ CHECKPOINTS_DIR = ROOT / "outputs" / "finetune" / "checkpoints"
 
 
 # 3-class custom mapping for the uzcosmos fine-tune.
-# We override "ignore" for 1700000000 so non-cropland samples are kept
-# as a real "no_crop" class (we sampled them deliberately as negatives).
+# "other_crops" is everything in uzcosmos that was checked as cropland but
+# is neither wheat nor cotton — NOT non-cropland. The 1700000000 key is
+# kept so parquets extracted before the ewoc_code was fixed still train
+# without re-extraction.
 UZCOSMOS_CLASS_MAPPING = {
     "UZCOSMOS3": {
         "1101010001": "wheat",        # bugdoy
         "1108000010": "fibre_crops",  # paxta
-        "1700000000": "no_crop",      # other
+        "1100000000": "other_crops",  # other (correct ewoc_code, going forward)
+        "1700000000": "other_crops",  # other (legacy — pre-fix extractions)
     }
 }
 

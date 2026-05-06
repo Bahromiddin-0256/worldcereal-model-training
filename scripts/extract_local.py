@@ -16,10 +16,17 @@ Why local
 
 Scope
 ~~~~~
-- v1: S2-L2A monthly median composites + S1-RTC monthly mean (Planetary
-  Computer STAC). Already-calibrated S1-RTC sidesteps SAR processing.
-- DEM (slope/elevation) and AgERA5 (precip/tmean) columns are emitted with
-  ``NODATAVALUE = 65535`` — ``process_parquet`` tolerates them.
+Full CDSE-equivalent feature set:
+
+- **S2-L2A**: monthly median composites with SCL cloud mask (Planetary Computer).
+- **S1-RTC**: monthly mean already-terrain-corrected sigma0 (Planetary Computer).
+- **DEM**: Cop-DEM-GLO-30 elevation + slope computed from elevation gradient.
+- **AgERA5**: monthly mean temperature + monthly mean daily precipitation_flux,
+  fetched via Open-Meteo Historical Weather API (ERA5-derived, no auth).
+
+All four families can be individually skipped via flags if the network/source
+is unavailable; missing values are filled with ``NODATAVALUE = 65535`` which
+``process_parquet`` tolerates.
 
 Usage
 ~~~~~
@@ -293,6 +300,204 @@ def _build_s1_monthly(
 
 
 # ---------------------------------------------------------------------------
+# Cop-DEM-GLO-30 → static elevation + slope per sample
+# ---------------------------------------------------------------------------
+
+def _build_dem_static(
+    samples: gpd.GeoDataFrame,
+    bbox: tuple[float, float, float, float],
+) -> dict[str, np.ndarray]:
+    """Return ``{"elevation": [...], "slope": [...]}`` (uint16 per sample).
+
+    - elevation: metres above sea level, clipped to uint16 range.
+    - slope: degrees, computed from elevation gradient on the local UTM grid
+      so dx/dy are metres (not degrees), then ``arctan(|grad|)`` in degrees.
+    - both values are nearest-neighbour sampled at the sample centroids.
+    """
+    items = _stac_search(
+        collection="cop-dem-glo-30",
+        bbox=bbox,
+        # cop-dem is static — a wide window guarantees all candidate tiles.
+        start="2010-01-01",
+        end="2030-12-31",
+    )
+    if not items:
+        _log.warning("Cop-DEM-GLO-30: no items for bbox %s", bbox)
+        return {
+            "elevation": np.full(len(samples), NODATAVALUE, dtype=np.uint16),
+            "slope": np.full(len(samples), NODATAVALUE, dtype=np.uint16),
+        }
+    _log.info("Cop-DEM-GLO-30: %d tile(s)", len(items))
+
+    # Open + clip each 1° tile, then mosaic via ``rio.merge``.
+    from rioxarray.merge import merge_arrays  # noqa: PLC0415
+
+    clipped: list[xr.DataArray] = []
+    for it in items:
+        try:
+            da = _open_clipped(_signed_href(it, "data"), bbox).squeeze("band")
+            # Drop the band dim cleanly.
+            if "band" in da.dims:
+                da = da.squeeze("band", drop=True)
+            clipped.append(da)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("DEM tile %s skipped: %s", it.id, exc)
+
+    if not clipped:
+        return {
+            "elevation": np.full(len(samples), NODATAVALUE, dtype=np.uint16),
+            "slope": np.full(len(samples), NODATAVALUE, dtype=np.uint16),
+        }
+
+    if len(clipped) == 1:
+        elev = clipped[0]
+    else:
+        elev = merge_arrays(clipped)
+        if "band" in elev.dims:
+            elev = elev.squeeze("band", drop=True)
+
+    # Reproject to local UTM so slope is computed in metres.
+    utm_crs = samples.estimate_utm_crs()
+    elev_utm = elev.rio.reproject(str(utm_crs))
+
+    arr = elev_utm.values.astype(np.float32)
+    # Pixel size in metres (rioxarray's transform exposes both).
+    tr = elev_utm.rio.transform()
+    px = abs(tr.a)
+    py = abs(tr.e)
+    gy, gx = np.gradient(arr, py, px)
+    slope_deg = np.degrees(np.arctan(np.sqrt(gx**2 + gy**2)))
+
+    slope_da = xr.DataArray(
+        slope_deg,
+        dims=elev_utm.dims,
+        coords=elev_utm.coords,
+    ).rio.write_crs(elev_utm.rio.crs)
+
+    pts_lonlat = np.column_stack(
+        [samples.geometry.x.values, samples.geometry.y.values]
+    )
+    elev_vals = _sample_points(elev_utm, pts_lonlat, src_crs=str(utm_crs))
+    slope_vals = _sample_points(slope_da, pts_lonlat, src_crs=str(utm_crs))
+
+    elev_u16 = np.where(np.isnan(elev_vals), NODATAVALUE,
+                        np.clip(elev_vals, 0, 65534)).astype(np.uint16)
+    slope_u16 = np.where(np.isnan(slope_vals), NODATAVALUE,
+                         np.clip(slope_vals, 0, 65534)).astype(np.uint16)
+    return {"elevation": elev_u16, "slope": slope_u16}
+
+
+# ---------------------------------------------------------------------------
+# AgERA5 monthly via Open-Meteo Historical Weather API (ERA5-derived)
+# ---------------------------------------------------------------------------
+
+OPEN_METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+
+def _snap_to_grid(lat: float, lon: float, step: float = 0.1) -> tuple[float, float]:
+    """Round to the nearest 0.1° cell (AgERA5 native resolution)."""
+    return round(lat / step) * step, round(lon / step) * step
+
+
+def _fetch_open_meteo_daily(
+    lat: float, lon: float, start: str, end: str,
+) -> pd.DataFrame:
+    """One HTTP call → DataFrame indexed by date with mean temp (K) and
+    daily precipitation (mm). Empty DataFrame on failure.
+    """
+    import urllib.request  # noqa: PLC0415
+    import json as _json  # noqa: PLC0415
+
+    params = {
+        "latitude": f"{lat:.4f}",
+        "longitude": f"{lon:.4f}",
+        "start_date": start,
+        "end_date": end,
+        "daily": "temperature_2m_mean,precipitation_sum",
+        "timezone": "UTC",
+    }
+    url = OPEN_METEO_URL + "?" + "&".join(f"{k}={v}" for k, v in params.items())
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            data = _json.loads(resp.read())
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("Open-Meteo fetch failed (%.4f, %.4f): %s", lat, lon, exc)
+        return pd.DataFrame()
+    daily = data.get("daily") or {}
+    if not daily.get("time"):
+        return pd.DataFrame()
+    df = pd.DataFrame(
+        {
+            "date": pd.to_datetime(daily["time"]),
+            "tmean_c": daily["temperature_2m_mean"],
+            "precip_mm": daily["precipitation_sum"],
+        }
+    ).set_index("date")
+    return df
+
+
+def _build_agera5_monthly(
+    samples: gpd.GeoDataFrame,
+    months: list[pd.Timestamp],
+    start_date: str,
+    end_date: str,
+) -> dict[pd.Timestamp, dict[str, np.ndarray]]:
+    """Return ``{month: {"AGERA5-PRECIP": arr, "AGERA5-TMEAN": arr}}``.
+
+    Encoding (matches CDSE parquets, decoded later by
+    ``worldcereal.train.predictors``):
+        AGERA5-TMEAN  = round(K * 100)        (e.g. 286.98 K → 28698)
+        AGERA5-PRECIP = round(mm_per_day * 100) (e.g. 1.85 mm/day → 185)
+    """
+    n = len(samples)
+    lats = samples.geometry.y.values
+    lons = samples.geometry.x.values
+
+    snapped = [_snap_to_grid(la, lo) for la, lo in zip(lats, lons)]
+    sample_to_cell = np.array(snapped)
+    unique_cells = sorted({tuple(c) for c in snapped})
+    _log.info("AgERA5: %d sample(s) -> %d unique 0.1° cell(s)", n, len(unique_cells))
+
+    cell_daily: dict[tuple[float, float], pd.DataFrame] = {}
+    for la, lo in unique_cells:
+        cell_daily[(la, lo)] = _fetch_open_meteo_daily(la, lo, start_date, end_date)
+
+    # For each month: per-cell aggregation, then broadcast back to samples.
+    out: dict[pd.Timestamp, dict[str, np.ndarray]] = {}
+    for m in months:
+        m_start = m
+        m_end = m + pd.offsets.MonthEnd(0)
+        cell_tmean: dict[tuple[float, float], float] = {}
+        cell_precip: dict[tuple[float, float], float] = {}
+        for cell, df in cell_daily.items():
+            if df.empty:
+                continue
+            sub = df.loc[(df.index >= m_start) & (df.index <= m_end)]
+            if sub.empty:
+                continue
+            tmean_c = sub["tmean_c"].mean(skipna=True)
+            precip_mm_per_day = sub["precip_mm"].mean(skipna=True)
+            if pd.notna(tmean_c):
+                cell_tmean[cell] = tmean_c
+            if pd.notna(precip_mm_per_day):
+                cell_precip[cell] = precip_mm_per_day
+
+        tmean_arr = np.full(n, NODATAVALUE, dtype=np.uint16)
+        precip_arr = np.full(n, NODATAVALUE, dtype=np.uint16)
+        for i in range(n):
+            cell = (sample_to_cell[i, 0], sample_to_cell[i, 1])
+            if cell in cell_tmean:
+                k_x_100 = (cell_tmean[cell] + 273.15) * 100.0
+                tmean_arr[i] = int(np.clip(round(k_x_100), 1, 65534))
+            if cell in cell_precip:
+                p_x_100 = cell_precip[cell] * 100.0
+                precip_arr[i] = int(np.clip(round(p_x_100), 0, 65534))
+        out[m] = {"AGERA5-TMEAN": tmean_arr, "AGERA5-PRECIP": precip_arr}
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Build the wide-format parquet
 # ---------------------------------------------------------------------------
 
@@ -307,6 +512,8 @@ def _build_rows(
     start_date: str,
     end_date: str,
     year: int,
+    dem_static: dict[str, np.ndarray] | None = None,
+    agera5_by_month: dict[pd.Timestamp, dict[str, np.ndarray]] | None = None,
 ) -> pd.DataFrame:
     """One row per (sample, month). Columns match CDSE wide-format schema."""
     pts_lonlat = np.column_stack([samples.geometry.x.values, samples.geometry.y.values])
@@ -339,6 +546,14 @@ def _build_rows(
             for parquet_col in S1_PARQUET_COLS:
                 s1_vals[parquet_col] = np.full(n_samples, NODATAVALUE, dtype=np.uint16)
 
+        # Per-month AgERA5 (uint16 already encoded).
+        if agera5_by_month and m in agera5_by_month:
+            tmean_month = agera5_by_month[m]["AGERA5-TMEAN"]
+            precip_month = agera5_by_month[m]["AGERA5-PRECIP"]
+        else:
+            tmean_month = np.full(n_samples, NODATAVALUE, dtype=np.uint16)
+            precip_month = np.full(n_samples, NODATAVALUE, dtype=np.uint16)
+
         for i in range(n_samples):
             row: dict = {
                 "feature_index": fi,
@@ -346,10 +561,10 @@ def _build_rows(
                 "timestamp": m,
                 **{c: int(s2_vals[c][i]) for c in S2_PARQUET_COLS},
                 **{c: int(s1_vals[c][i]) for c in S1_PARQUET_COLS},
-                "slope": NODATAVALUE,
-                "elevation": NODATAVALUE,
-                "AGERA5-PRECIP": NODATAVALUE,
-                "AGERA5-TMEAN": NODATAVALUE,
+                "slope": int(dem_static["slope"][i]) if dem_static is not None else NODATAVALUE,
+                "elevation": int(dem_static["elevation"][i]) if dem_static is not None else NODATAVALUE,
+                "AGERA5-PRECIP": int(precip_month[i]),
+                "AGERA5-TMEAN": int(tmean_month[i]),
                 "lon": float(pts_lonlat[i, 0]),
                 "lat": float(pts_lonlat[i, 1]),
                 "geometry": samples.geometry.iloc[i],
@@ -397,9 +612,16 @@ def cli() -> None:
 @click.option("--cloud-cover-max", default=80, show_default=True, type=int)
 @click.option("--out-dir", default=None, type=click.Path(),
               help="Defaults to outputs/finetune/extractions/<ref_id>/")
+@click.option("--skip-s2", is_flag=True, default=False, help="Fill all S2 bands with NODATAVALUE.")
+@click.option("--skip-s1", is_flag=True, default=False, help="Fill all S1 bands with NODATAVALUE.")
+@click.option("--skip-dem", is_flag=True, default=False, help="Fill slope/elevation with NODATAVALUE.")
+@click.option("--skip-agera5", is_flag=True, default=False, help="Fill AGERA5 cols with NODATAVALUE.")
+@click.option("--max-samples", default=None, type=int, help="Cap sample count (smoketest).")
 def extract(
     samples_path: str, ref_id: str, start_date: str, end_date: str,
     tile: str, cloud_cover_max: int, out_dir: str | None,
+    skip_s2: bool, skip_s1: bool, skip_dem: bool, skip_agera5: bool,
+    max_samples: int | None,
 ) -> None:
     """Extract one tile's worth of samples locally → CDSE-format geoparquet."""
     out_path_dir = Path(out_dir) if out_dir else (EXTRACTIONS_ROOT / ref_id)
@@ -410,20 +632,33 @@ def extract(
         raise click.ClickException("samples geoparquet must have a geometry column")
     if samples.crs is None or str(samples.crs) != "EPSG:4326":
         samples = samples.to_crs("EPSG:4326")
+    if max_samples is not None and len(samples) > max_samples:
+        samples = samples.iloc[:max_samples].reset_index(drop=True)
+        _log.info("capped samples to %d (smoketest)", max_samples)
     _log.info("loaded %d samples from %s", len(samples), samples_path)
 
     bbox = _bbox_from_samples(samples)
     months = _months_between(pd.Timestamp(start_date), pd.Timestamp(end_date))
     _log.info("range: %s..%s -> %d months", start_date, end_date, len(months))
 
-    s2_by_month = _build_s2_monthly(bbox, months, cloud_cover_max=cloud_cover_max)
-    s1_by_month = _build_s1_monthly(bbox, months)
+    s2_by_month = (
+        {} if skip_s2
+        else _build_s2_monthly(bbox, months, cloud_cover_max=cloud_cover_max)
+    )
+    s1_by_month = {} if skip_s1 else _build_s1_monthly(bbox, months)
+    dem_static = None if skip_dem else _build_dem_static(samples, bbox)
+    agera5_by_month = (
+        None if skip_agera5
+        else _build_agera5_monthly(samples, months, start_date, end_date)
+    )
 
     year = max(months).year
     df = _build_rows(
         samples, s2_by_month, s1_by_month, months,
         tile=tile, ref_id=ref_id,
         start_date=start_date, end_date=end_date, year=year,
+        dem_static=dem_static,
+        agera5_by_month=agera5_by_month,
     )
 
     gdf = gpd.GeoDataFrame(df, geometry="geometry", crs="EPSG:4326")

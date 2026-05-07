@@ -43,6 +43,21 @@ import os
 from pathlib import Path
 from typing import Iterable
 
+# GDAL/curl tuning for COG range-reads. Must be set BEFORE rasterio imports.
+# - HTTP/2 multiplexing: many concurrent reads share one TLS connection.
+# - VSI_CACHE: in-process LRU keeps recently-fetched COG headers / blocks
+#   so repeated band reads of the same scene reuse already-fetched bytes.
+# - DISABLE_READDIR_ON_OPEN: skips a ``LIST`` call that's pointless on
+#   single-COG buckets and adds 100-200 ms per asset on Azure blob storage.
+os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
+os.environ.setdefault("VSI_CACHE", "TRUE")
+os.environ.setdefault("VSI_CACHE_SIZE", "536870912")  # 512 MiB
+os.environ.setdefault("GDAL_HTTP_MULTIPLEX", "YES")
+os.environ.setdefault("GDAL_HTTP_VERSION", "2")
+os.environ.setdefault("CPL_VSIL_CURL_USE_HEAD", "NO")
+os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "3")
+os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "1")
+
 import click
 import geopandas as gpd
 import numpy as np
@@ -76,6 +91,28 @@ S1_PARQUET_COLS = ["S1-SIGMA0-VH", "S1-SIGMA0-VV"]
 SCL_DROP = {3, 8, 9, 10, 11}
 
 PC_STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
+
+
+def _l2a_boa_offset(item) -> int:
+    """Return the BOA_ADD_OFFSET magnitude for an S2-L2A STAC item.
+
+    Items processed with baseline ≥ 04.00 (introduced 2022-01-25) carry an
+    additive offset of −1000 in the surface reflectance bands. Microsoft
+    Planetary Computer serves the **raw DN with the offset still embedded**,
+    while the WorldCereal training contract (CDSE openEO `SENTINEL2_L2A`)
+    expects the offset already applied. Without subtracting this magnitude
+    every fine-tune sample lands ~+1000 above the pretrained encoder's
+    distribution; the head learned at fine-tune time then maps "encoder-
+    confused features → labels", and inference on offset-corrected cubes
+    silently produces wrong predictions.
+
+    Pre-baseline scenes (2018–2021) → 0. SCL is not affected by the offset.
+    """
+    baseline = item.properties.get("s2:processing_baseline")
+    try:
+        return 1000 if baseline is not None and float(baseline) >= 4.00 else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 def _sigma0_linear_to_uint16(arr: np.ndarray) -> np.ndarray:
@@ -174,12 +211,18 @@ def _build_s2_monthly(
     bbox: tuple[float, float, float, float],
     months: list[pd.Timestamp],
     cloud_cover_max: int = 80,
+    max_scenes_per_month: int = 4,
 ) -> dict[pd.Timestamp, dict[str, xr.DataArray]]:
     """All COG reads are clipped to ``bbox`` (WGS84) — see ``_open_clipped``."""
     """Returns {month_ts: {band_name: 2D DataArray}} — uint16 DN scale.
 
-    Stacks all scenes overlapping each month, applies SCL cloud mask, takes
-    median per band. Skips a month if there are zero clear pixels.
+    Stacks the ``max_scenes_per_month`` cleanest scenes per month (sorted by
+    ``eo:cloud_cover`` ASC), applies SCL cloud mask, takes median per band.
+    Skips a month if there are zero clear pixels.
+
+    Why a scene cap: monthly median converges quickly — 4 cleanest scenes
+    deliver virtually the same composite as 20+, while cutting download
+    time ~5×. Matches sentinelhub's ``_WC_MAX_SCENES_PER_MONTH_S2``.
     """
     items_all = _stac_search(
         collection="sentinel-2-l2a",
@@ -203,17 +246,35 @@ def _build_s2_monthly(
         if not items:
             _log.warning("S2 month %s: no scenes", m.date())
             continue
-        _log.info("S2 month %s: %d scenes", m.date(), len(items))
+        # Cap: keep the cleanest N scenes by eo:cloud_cover.
+        if max_scenes_per_month and len(items) > max_scenes_per_month:
+            items = sorted(
+                items,
+                key=lambda it: it.properties.get("eo:cloud_cover", 100.0),
+            )[:max_scenes_per_month]
+        _log.info("S2 month %s: %d scenes (cap=%d)",
+                  m.date(), len(items), max_scenes_per_month)
 
         scene_stacks: list[xr.DataArray] = []
         for it in items:
             try:
+                offset = _l2a_boa_offset(it)
                 scl = _open_clipped(_signed_href(it, "SCL"), bbox).squeeze("band")
                 cloud = scl.isin(list(SCL_DROP))
                 bands = []
                 for b in S2_BAND_NAMES:
                     da = _open_clipped(_signed_href(it, b), bbox).squeeze("band")
-                    da = da.rio.reproject_match(scl).where(~cloud, NODATAVALUE)
+                    da = da.rio.reproject_match(scl)
+                    if offset:
+                        # Subtract baseline-04.00 BOA_ADD_OFFSET, clamp at 0,
+                        # then re-apply the cloud mask. The order matters: if
+                        # we masked first the offset would shift NODATAVALUE
+                        # itself by −1000, breaking downstream comparisons.
+                        da = xr.where(
+                            da == NODATAVALUE, NODATAVALUE,
+                            xr.where(da > offset, da - offset, 0),
+                        )
+                    da = da.where(~cloud, NODATAVALUE)
                     bands.append(da.expand_dims(band=[b]))
                 scene_stacks.append(xr.concat(bands, dim="band"))
             except Exception as exc:  # noqa: BLE001
@@ -236,18 +297,61 @@ def _build_s2_monthly(
 # S1-RTC monthly mean
 # ---------------------------------------------------------------------------
 
+def _select_best_s1_orbit(
+    bbox: tuple[float, float, float, float],
+    start: str,
+    end: str,
+) -> str | None:
+    """Pick the S1 orbit direction with more items overlapping *bbox* across
+    the year window. Mirrors training's ``select_best_s1_orbit_direction``
+    in ``worldcereal/openeo/preprocessing.py`` so the encoder sees the same
+    look-angle pattern at fine-tune time as at inference.
+    """
+    counts: dict[str, int] = {}
+    for orbit in ("ascending", "descending"):
+        items = _stac_search(
+            collection="sentinel-1-rtc",
+            bbox=bbox,
+            start=start,
+            end=end,
+            extra_query={"sat:orbit_state": {"eq": orbit}},
+        )
+        counts[orbit] = len(items)
+    _log.info("S1 orbit counts over %s..%s: %s", start, end, counts)
+    if not any(counts.values()):
+        return None
+    return max(counts, key=counts.get)
+
+
 def _build_s1_monthly(
     bbox: tuple[float, float, float, float],
     months: list[pd.Timestamp],
+    max_scenes_per_month: int = 6,
 ) -> dict[pd.Timestamp, dict[str, xr.DataArray]]:
     """S1-RTC is already terrain-corrected sigma0 (linear). Monthly mean →
     uint16 sigma0-encoded.
+
+    Filters to a single best-overlap orbit direction so backscatter texture
+    matches what training expects. Cap: keeps the chronologically first
+    ``max_scenes_per_month`` scenes per month (S1 has no cloud-cover;
+    relative-orbit / acquisition-date spread is already implicit).
     """
+    start = str(months[0].date())
+    end = str((months[-1] + pd.offsets.MonthEnd(0)).date())
+
+    s1_orbit = _select_best_s1_orbit(bbox, start, end)
+    _log.info("S1 orbit selected: %s", s1_orbit)
+
+    extra_query: dict | None = None
+    if s1_orbit:
+        extra_query = {"sat:orbit_state": {"eq": s1_orbit}}
+
     items_all = _stac_search(
         collection="sentinel-1-rtc",
         bbox=bbox,
-        start=str(months[0].date()),
-        end=str((months[-1] + pd.offsets.MonthEnd(0)).date()),
+        start=start,
+        end=end,
+        extra_query=extra_query,
     )
     _log.info("S1-RTC STAC: %d items in bbox %s", len(items_all), bbox)
 
@@ -264,7 +368,13 @@ def _build_s1_monthly(
         if not items:
             _log.warning("S1 month %s: no scenes", m.date())
             continue
-        _log.info("S1 month %s: %d scenes", m.date(), len(items))
+        if max_scenes_per_month and len(items) > max_scenes_per_month:
+            items = sorted(
+                items,
+                key=lambda it: it.properties.get("datetime", ""),
+            )[:max_scenes_per_month]
+        _log.info("S1 month %s: %d scenes (cap=%d)",
+                  m.date(), len(items), max_scenes_per_month)
 
         per_pol: dict[str, list] = {"vh": [], "vv": []}
         ref = None
@@ -336,7 +446,6 @@ def _build_dem_static(
     for it in items:
         try:
             da = _open_clipped(_signed_href(it, "data"), bbox).squeeze("band")
-            # Drop the band dim cleanly.
             if "band" in da.dims:
                 da = da.squeeze("band", drop=True)
             clipped.append(da)
@@ -610,6 +719,10 @@ def cli() -> None:
 @click.option("--end-date", required=True, help="YYYY-MM-DD inclusive.")
 @click.option("--tile", required=True, help="MGRS tile id (e.g. 42TUK). Stored in the parquet's 'tile' column.")
 @click.option("--cloud-cover-max", default=80, show_default=True, type=int)
+@click.option("--s2-max-scenes-per-month", default=4, show_default=True, type=int,
+              help="Top-N cleanest S2 scenes per month. 0 disables cap.")
+@click.option("--s1-max-scenes-per-month", default=6, show_default=True, type=int,
+              help="First-N S1 scenes per month (chronological). 0 disables cap.")
 @click.option("--out-dir", default=None, type=click.Path(),
               help="Defaults to outputs/finetune/extractions/<ref_id>/")
 @click.option("--skip-s2", is_flag=True, default=False, help="Fill all S2 bands with NODATAVALUE.")
@@ -619,7 +732,9 @@ def cli() -> None:
 @click.option("--max-samples", default=None, type=int, help="Cap sample count (smoketest).")
 def extract(
     samples_path: str, ref_id: str, start_date: str, end_date: str,
-    tile: str, cloud_cover_max: int, out_dir: str | None,
+    tile: str, cloud_cover_max: int,
+    s2_max_scenes_per_month: int, s1_max_scenes_per_month: int,
+    out_dir: str | None,
     skip_s2: bool, skip_s1: bool, skip_dem: bool, skip_agera5: bool,
     max_samples: int | None,
 ) -> None:
@@ -643,9 +758,19 @@ def extract(
 
     s2_by_month = (
         {} if skip_s2
-        else _build_s2_monthly(bbox, months, cloud_cover_max=cloud_cover_max)
+        else _build_s2_monthly(
+            bbox, months,
+            cloud_cover_max=cloud_cover_max,
+            max_scenes_per_month=s2_max_scenes_per_month,
+        )
     )
-    s1_by_month = {} if skip_s1 else _build_s1_monthly(bbox, months)
+    s1_by_month = (
+        {} if skip_s1
+        else _build_s1_monthly(
+            bbox, months,
+            max_scenes_per_month=s1_max_scenes_per_month,
+        )
+    )
     dem_static = None if skip_dem else _build_dem_static(samples, bbox)
     agera5_by_month = (
         None if skip_agera5
